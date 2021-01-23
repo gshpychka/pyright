@@ -262,6 +262,7 @@ interface ValidateArgTypeParams {
     argument: FunctionArgument;
     errorNode: ExpressionNode;
     paramName?: string;
+    mapsToVarArgList?: boolean;
 }
 
 interface ClassMemberLookup {
@@ -4468,7 +4469,10 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             const typeParameters = baseType.typeAliasInfo.typeParameters;
             const typeArgs = getTypeArgs(node, flags);
 
-            if (typeArgs.length > typeParameters.length) {
+            if (
+                typeArgs.length > typeParameters.length &&
+                !typeParameters.some((typeVar) => typeVar.details.isVariadic)
+            ) {
                 addError(
                     Localizer.Diagnostic.typeArgsTooMany().format({
                         name: printType(baseType),
@@ -4482,13 +4486,9 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             const typeVarMap = new TypeVarMap(baseType.typeAliasInfo.typeVarScopeId);
             const diag = new DiagnosticAddendum();
             typeParameters.forEach((param, index) => {
-                assignTypeToTypeVar(
-                    param,
-                    index < typeArgs.length ? convertToInstance(typeArgs[index].type) : UnknownType.create(),
-                    /* canNarrowType */ false,
-                    diag,
-                    typeVarMap
-                );
+                const typeArgType: Type =
+                    index < typeArgs.length ? convertToInstance(typeArgs[index].type) : UnknownType.create();
+                assignTypeToTypeVar(param, typeArgType, /* canNarrowType */ false, diag, typeVarMap);
             });
 
             if (!diag.isEmpty()) {
@@ -6458,7 +6458,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             positionalArgCount = Math.min(positionOnlyWithoutDefaultsCount, argList.length);
         }
 
-        const validateArgTypeParams: ValidateArgTypeParams[] = [];
+        let validateArgTypeParams: ValidateArgTypeParams[] = [];
 
         let activeParam: FunctionParameter | undefined;
         function trySetActive(arg: FunctionArgument, param: FunctionParameter) {
@@ -6610,6 +6610,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
                         argument: argList[argIndex],
                         errorNode: argList[argIndex].valueExpression || errorNode,
                         paramName: typeParams[paramIndex].name,
+                        mapsToVarArgList: true,
                     });
                 }
                 trySetActive(argList[argIndex], typeParams[paramIndex]);
@@ -6812,6 +6813,41 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         // bother doing the extra work here. This occurs frequently when attempting to find the
         // correct overload.
         if (!reportedArgError || !speculativeTypeTracker.isSpeculative(undefined)) {
+            // If there are arguments that map to a variadic *args parameter, see
+            // if the type of that *args parameter is a variadic type variable. If so,
+            // we'll preprocess those arguments and combine them into a tuple.
+            const variadicArgs = validateArgTypeParams.filter((argParam) => argParam.mapsToVarArgList);
+            if (variadicArgs.length > 0) {
+                const paramType = variadicArgs[0].paramType;
+                if (isTypeVar(paramType) && paramType.details.isVariadic) {
+                    // TODO - check whether any of the arguments in variadicArgs are
+                    // variadic (*args). These are not allowed because we don't know
+                    // their length.
+
+                    const tupleClass = getBuiltInType(errorNode, 'tuple');
+                    if (tupleClass && isClass(tupleClass)) {
+                        const tupleTypeArgs = variadicArgs.map((argParam) => getTypeForArgument(argParam.argument));
+                        const specializedTuple = ObjectType.create(
+                            ClassType.cloneForSpecialization(
+                                tupleClass,
+                                [combineTypes(tupleTypeArgs) || UnknownType.create()],
+                                /* isTypeArgumentExplicit */ true,
+                                /* skipAbstractClassTest */ true,
+                                tupleTypeArgs
+                            )
+                        );
+
+                        const combinedArg = { ...variadicArgs[0] };
+                        combinedArg.argument = { argumentCategory: ArgumentCategory.Simple, type: specializedTuple };
+
+                        validateArgTypeParams = [
+                            ...validateArgTypeParams.filter((argParam) => !argParam.mapsToVarArgList),
+                            combinedArg,
+                        ];
+                    }
+                }
+            }
+
             // Run through all args and validate them against their matched parameter.
             // We'll do two passes. The first one will match any type arguments. The second
             // will perform the actual validation. We can skip the first pass if there
@@ -7222,6 +7258,10 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
                             typeVar.details.variance = Variance.Contravariant;
                         }
                     }
+                } else if (paramName === 'variadic' && !isParamSpec) {
+                    if (argList[i].valueExpression && getBooleanValue(argList[i].valueExpression!)) {
+                        typeVar.details.isVariadic = true;
+                    }
                 } else {
                     addError(
                         isParamSpec
@@ -7252,6 +7292,11 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
                 addError(Localizer.Diagnostic.paramSpecUnknownArg(), argList[i].valueExpression || errorNode);
                 break;
             }
+        }
+
+        if (typeVar.details.isVariadic) {
+            // TODO - need to check for bound, constraint, and covariance/contravariance,
+            // which cannot be used in conjunction with variadic.
         }
 
         if (!isParamSpec && typeVar.details.constraints.length === 1 && firstConstraintArg) {

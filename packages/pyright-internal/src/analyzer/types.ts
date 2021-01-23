@@ -1390,6 +1390,7 @@ export interface TypeVarDetails {
     boundType?: Type;
     variance: Variance;
     isParamSpec: boolean;
+    isVariadic: boolean;
 
     // Internally created (e.g. for pseudo-generic classes)
     isSynthesized: boolean;
@@ -1465,6 +1466,7 @@ export namespace TypeVarType {
                 constraints: [],
                 variance: Variance.Invariant,
                 isParamSpec,
+                isVariadic: false,
                 isSynthesized: false,
             },
             flags: typeFlags,
