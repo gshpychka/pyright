@@ -311,11 +311,6 @@ export const enum EvaluatorFlags {
     // than an instance (object)
     ExpectingType = 1 << 6,
 
-    // The Tuple type allows the use of a tuple literal
-    // expression "()" as a type argument. When this appears
-    // as a type argument in other contexts, it's illegal.
-    AllowEmptyTupleAsType = 1 << 7,
-
     // Interpret an ellipsis type annotation to mean "Unknown".
     ConvertEllipsisToUnknown = 1 << 8,
 
@@ -1089,7 +1084,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
                     ClassType.isPseudoVariadicTypeParam(resultType.classType) &&
                     resultType.classType.variadicTypeArguments?.length === 0;
 
-                if ((flags & EvaluatorFlags.AllowEmptyTupleAsType) === 0 || !isEmptyVariadic) {
+                if (!isEmptyVariadic) {
                     addExpectedClassDiagnostic(typeResult.type, node);
                 }
             }
@@ -4454,6 +4449,37 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         return getTypeFromIndexWithBaseType(node, baseTypeResult.type, { method: 'get' }, flags);
     }
 
+    function adjustTypeArgumentsForVariadicTypeVar(
+        node: ParseNode,
+        typeArgs: TypeResult[],
+        typeParameters: TypeVarType[]
+    ): TypeResult[] {
+        const lastTypeParam = typeParameters[typeParameters.length - 1];
+
+        // Do we need to adjust the type arguments to map to a variadic type
+        // param at the end of the list?
+        if (lastTypeParam && lastTypeParam.details.isVariadic && typeArgs.length >= typeParameters.length) {
+            const builtInTupleType = getBuiltInType(node, 'tuple');
+            if (isClass(builtInTupleType)) {
+                // The remaining arguments map to the variadic type var
+                // at the end of the type parameter list.
+                const tupleType = convertToInstance(
+                    specializeVariadicGenericClass(
+                        builtInTupleType,
+                        typeArgs
+                            .slice(typeParameters.length - 1)
+                            .map((typeResult) => convertToInstance(typeResult.type))
+                    )
+                );
+
+                typeArgs = typeArgs.slice(0, typeParameters.length);
+                typeArgs[typeParameters.length - 1].type = tupleType;
+            }
+        }
+
+        return typeArgs;
+    }
+
     function getTypeFromIndexWithBaseType(
         node: IndexNode,
         baseType: Type,
@@ -4467,7 +4493,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             !baseType.typeAliasInfo.typeArguments
         ) {
             const typeParameters = baseType.typeAliasInfo.typeParameters;
-            const typeArgs = getTypeArgs(node, flags);
+            const typeArgs = adjustTypeArgumentsForVariadicTypeVar(node, getTypeArgs(node, flags), typeParameters);
 
             if (
                 typeArgs.length > typeParameters.length &&
@@ -4593,19 +4619,18 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
                     return ObjectType.create(concreteSubtype);
                 }
 
-                // Handle the case where the base type allows for a variable number
-                // of type arguments. We need to perform special processing of the
-                // type args in this case to permit empty tuples.
-                let adjustedFlags = flags;
-                if (isClass(concreteSubtype) && ClassType.isPseudoVariadicTypeParam(concreteSubtype)) {
-                    adjustedFlags |= EvaluatorFlags.AllowEmptyTupleAsType;
-                }
-
                 const isAnnotatedClass = isClass(concreteSubtype) && ClassType.isBuiltIn(concreteSubtype, 'Annotated');
                 const hasCustomClassGetItem =
                     isClass(concreteSubtype) && ClassType.hasCustomClassGetItem(concreteSubtype);
 
-                const typeArgs = getTypeArgs(node, adjustedFlags, isAnnotatedClass, hasCustomClassGetItem);
+                let typeArgs = getTypeArgs(node, flags, isAnnotatedClass, hasCustomClassGetItem);
+                if (!isAnnotatedClass) {
+                    typeArgs = adjustTypeArgumentsForVariadicTypeVar(
+                        node,
+                        typeArgs,
+                        concreteSubtype.details.typeParameters
+                    );
+                }
 
                 // If this is a custom __class_getitem__, there's no need to specialize the class.
                 // Just return it as is.
@@ -4889,14 +4914,8 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         const typeArgs: TypeResult[] = [];
         const adjFlags = flags & ~EvaluatorFlags.ParamSpecDisallowed;
 
-        let items = node.items;
-
         // A single tuple is treated the same as a list of items in the index.
-        if (items.length === 1 && items[0].nodeType === ParseNodeType.Tuple) {
-            items = items[0].expressions;
-        }
-
-        items.forEach((expr, index) => {
+        node.items.forEach((expr, index) => {
             // If it's a custom __class_getitem__, none of the arguments should be
             // treated as types. If it's an Annotated[a, b, c], only the first index
             // should be treated as a type. The others can be regular (non-type) objects.
@@ -6826,7 +6845,9 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
 
                     const tupleClass = getBuiltInType(errorNode, 'tuple');
                     if (tupleClass && isClass(tupleClass)) {
-                        const tupleTypeArgs = variadicArgs.map((argParam) => getTypeForArgument(argParam.argument));
+                        const tupleTypeArgs = variadicArgs.map((argParam) =>
+                            stripLiteralValue(getTypeForArgument(argParam.argument))
+                        );
                         const specializedTuple = ObjectType.create(
                             ClassType.cloneForSpecialization(
                                 tupleClass,
@@ -14236,8 +14257,15 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             return classType;
         }
 
+        const lastTypeParam = typeParameters.length > 0 ? typeParameters[typeParameters.length - 1] : undefined;
+        const isLastTypeParamVariadic = lastTypeParam ? lastTypeParam.details.isVariadic : false;
+
         if (typeArgs && typeArgCount > typeParameters.length) {
-            if (!ClassType.isPartiallyConstructed(classType) && !ClassType.isPseudoVariadicTypeParam(classType)) {
+            if (
+                !ClassType.isPartiallyConstructed(classType) &&
+                !ClassType.isPseudoVariadicTypeParam(classType) &&
+                !isLastTypeParamVariadic
+            ) {
                 const fileInfo = getFileInfo(errorNode);
                 if (typeParameters.length === 0) {
                     addDiagnostic(
@@ -14261,17 +14289,19 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             }
             typeArgCount = typeParameters.length;
         } else if (typeArgs && typeArgCount < typeParameters.length) {
-            const fileInfo = getFileInfo(errorNode);
-            addDiagnostic(
-                fileInfo.diagnosticRuleSet.reportMissingTypeArgument,
-                DiagnosticRule.reportMissingTypeArgument,
-                Localizer.Diagnostic.typeArgsTooFew().format({
-                    name: classType.aliasName || classType.details.name,
-                    expected: typeParameters.length,
-                    received: typeArgCount,
-                }),
-                typeArgs[0].node.parent!
-            );
+            if (!isLastTypeParamVariadic) {
+                const fileInfo = getFileInfo(errorNode);
+                addDiagnostic(
+                    fileInfo.diagnosticRuleSet.reportMissingTypeArgument,
+                    DiagnosticRule.reportMissingTypeArgument,
+                    Localizer.Diagnostic.typeArgsTooFew().format({
+                        name: classType.aliasName || classType.details.name,
+                        expected: typeParameters.length,
+                        received: typeArgCount,
+                    }),
+                    typeArgs.length > 0 ? typeArgs[0].node.parent! : errorNode
+                );
+            }
         }
 
         if (typeArgs) {

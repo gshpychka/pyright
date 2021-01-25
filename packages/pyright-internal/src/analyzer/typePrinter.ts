@@ -387,38 +387,65 @@ export function printObjectTypeForClass(
     // If this is a pseudo-generic class, don't display the type arguments
     // or type parameters because it will confuse users.
     if (!ClassType.isPseudoGenericClass(type)) {
+        const typeParams = ClassType.getTypeParameters(type);
+        const lastTypeParam = typeParams.length > 0 ? typeParams[typeParams.length - 1] : undefined;
+        const isVariadic = lastTypeParam ? lastTypeParam.details.isVariadic : false;
+
         // If there is a type arguments array, it's a specialized class.
         const typeArgs = type.variadicTypeArguments || type.typeArguments;
         if (typeArgs) {
             // Handle Tuple[()] as a special case.
             if (typeArgs.length > 0) {
-                if (
-                    (printTypeFlags & PrintTypeFlags.OmitTypeArgumentsIfAny) === 0 ||
-                    typeArgs.some((typeArg) => !isAnyOrUnknown(typeArg))
-                ) {
-                    objName +=
-                        '[' +
-                        typeArgs
-                            .map((typeArg) => {
-                                return printType(
-                                    typeArg,
-                                    printTypeFlags,
-                                    returnTypeCallback,
-                                    /* expandTypeAlias */ false,
-                                    recursionCount + 1
-                                );
-                            })
-                            .join(', ') +
-                        ']';
+                const typeArgStrings: string[] = [];
+                const isAllAny = true;
+
+                typeArgs.forEach((typeArg, index) => {
+                    const typeParam = index < typeParams.length ? typeParams[index] : undefined;
+                    if (
+                        typeParam &&
+                        typeParam.details.isVariadic &&
+                        isObject(typeArg) &&
+                        ClassType.isBuiltIn(typeArg.classType, 'tuple') &&
+                        typeArg.classType.variadicTypeArguments
+                    ) {
+                        // Expand the tuple type that maps to the variadic type parameter.
+                        if (typeArg.classType.variadicTypeArguments.length === 0) {
+                            typeArgStrings.push('()');
+                        } else {
+                            typeArgStrings.push(
+                                ...typeArg.classType.variadicTypeArguments!.map((typeArg) =>
+                                    printType(
+                                        typeArg,
+                                        printTypeFlags,
+                                        returnTypeCallback,
+                                        /* expandTypeAlias */ false,
+                                        recursionCount + 1
+                                    )
+                                )
+                            );
+                        }
+                    } else {
+                        typeArgStrings.push(
+                            printType(
+                                typeArg,
+                                printTypeFlags,
+                                returnTypeCallback,
+                                /* expandTypeAlias */ false,
+                                recursionCount + 1
+                            )
+                        );
+                    }
+                });
+
+                if ((printTypeFlags & PrintTypeFlags.OmitTypeArgumentsIfAny) === 0 || !isAllAny) {
+                    objName += '[' + typeArgStrings.join(', ') + ']';
                 }
             } else {
-                if (ClassType.isPseudoVariadicTypeParam(type)) {
+                if (ClassType.isPseudoVariadicTypeParam(type) || isVariadic) {
                     objName += '[()]';
                 }
             }
         } else {
-            const typeParams = ClassType.getTypeParameters(type);
-
             if (typeParams.length > 0) {
                 if (
                     (printTypeFlags & PrintTypeFlags.OmitTypeArgumentsIfAny) === 0 ||
