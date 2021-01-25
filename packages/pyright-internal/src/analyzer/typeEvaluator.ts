@@ -224,6 +224,10 @@ interface TypeResult {
     type: Type;
     node: ExpressionNode;
 
+    // Variadic type arguments allow the shorthand "()" to
+    // represent an empty tuple (i.e. Tuple[()]).
+    isEmptyTupleShorthand?: boolean;
+
     // Is the type incomplete (i.e. not fully evaluated) because
     // some of the paths involve cyclical dependencies?
     isIncomplete?: boolean;
@@ -854,7 +858,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
             }
 
             case ParseNodeType.Tuple: {
-                typeResult = getTypeFromTuple(node, expectedTypeAlt);
+                typeResult = getTypeFromTuple(node, expectedTypeAlt, flags);
                 break;
             }
 
@@ -4461,16 +4465,15 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         if (lastTypeParam && lastTypeParam.details.isVariadic && typeArgs.length >= typeParameters.length) {
             const builtInTupleType = getBuiltInType(node, 'tuple');
             if (isClass(builtInTupleType)) {
+                const variadicTypeResults = typeArgs.slice(typeParameters.length - 1);
+                const variadicTypes: Type[] =
+                    variadicTypeResults.length === 1 && variadicTypeResults[0].isEmptyTupleShorthand
+                        ? []
+                        : variadicTypeResults.map((typeResult) => convertToInstance(typeResult.type));
+
                 // The remaining arguments map to the variadic type var
                 // at the end of the type parameter list.
-                const tupleType = convertToInstance(
-                    specializeVariadicGenericClass(
-                        builtInTupleType,
-                        typeArgs
-                            .slice(typeParameters.length - 1)
-                            .map((typeResult) => convertToInstance(typeResult.type))
-                    )
-                );
+                const tupleType = convertToInstance(specializeVariadicGenericClass(builtInTupleType, variadicTypes));
 
                 typeArgs = typeArgs.slice(0, typeParameters.length);
                 typeArgs[typeParameters.length - 1].type = tupleType;
@@ -4963,7 +4966,15 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         return typeResult;
     }
 
-    function getTypeFromTuple(node: TupleNode, expectedType: Type | undefined): TypeResult {
+    function getTypeFromTuple(node: TupleNode, expectedType: Type | undefined, flags: EvaluatorFlags): TypeResult {
+        if ((flags & EvaluatorFlags.ExpectingType) !== 0 && node.expressions.length === 0 && !expectedType) {
+            const builtInTuple = getBuiltInType(node, 'tuple');
+            if (isClass(builtInTuple)) {
+                const emptyTuple = convertToInstance(specializeVariadicGenericClass(builtInTuple, []));
+                return { type: emptyTuple, node, isEmptyTupleShorthand: true };
+            }
+        }
+
         // If the expected type is a union, recursively call for each of the subtypes
         // to find one that matches.
         let effectiveExpectedType = expectedType;
@@ -9413,7 +9424,7 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
     }
 
     // Verifies that a type argument's type is not disallowed.
-    function validateTypeArg(argResult: TypeResult): boolean {
+    function validateTypeArg(argResult: TypeResult, allowEmptyTuple = false): boolean {
         if (argResult.typeList) {
             addError(Localizer.Diagnostic.typeArgListNotAllowed(), argResult.node);
             return false;
@@ -9431,6 +9442,11 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
 
         if (isParamSpecType(argResult.type)) {
             addError(Localizer.Diagnostic.paramSpecContext(), argResult.node);
+            return false;
+        }
+
+        if (!allowEmptyTuple && argResult.isEmptyTupleShorthand) {
+            addError(Localizer.Diagnostic.zeroLengthTupleNotAllowed(), argResult.node);
             return false;
         }
 
@@ -9757,30 +9773,21 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         const isVariadicTypeParam = ClassType.isPseudoVariadicTypeParam(classType);
 
         if (typeArgs) {
-            // Verify that we didn't receive any inappropriate ellipses or modules.
-            typeArgs.forEach((typeArg, index) => {
-                if (isEllipsisType(typeArg.type)) {
-                    if (!isVariadicTypeParam) {
-                        addError(Localizer.Diagnostic.ellipsisContext(), typeArg.node);
-                    } else if (typeArgs!.length !== 2 || index !== 1) {
-                        addError(Localizer.Diagnostic.ellipsisSecondArg(), typeArg.node);
+            if (isVariadicTypeParam && typeArgs.length === 1 && typeArgs[0].isEmptyTupleShorthand) {
+                typeArgs = [];
+            } else {
+                // Verify that we didn't receive any inappropriate ellipses or modules.
+                typeArgs.forEach((typeArg, index) => {
+                    if (isEllipsisType(typeArg.type)) {
+                        if (!isVariadicTypeParam) {
+                            addError(Localizer.Diagnostic.ellipsisContext(), typeArg.node);
+                        } else if (typeArgs!.length !== 2 || index !== 1) {
+                            addError(Localizer.Diagnostic.ellipsisSecondArg(), typeArg.node);
+                        }
+                    } else if (!allowParamSpec || !isParamSpecType(typeArg.type)) {
+                        validateTypeArg(typeArg);
                     }
-                } else if (!allowParamSpec || !isParamSpecType(typeArg.type)) {
-                    validateTypeArg(typeArg);
-                }
-            });
-
-            // Handle [()] as a special case, as defined in PEP 483 for Tuples.
-            if (isVariadicTypeParam) {
-                if (
-                    typeArgs.length === 1 &&
-                    isObject(typeArgs[0].type) &&
-                    isTupleClass(typeArgs[0].type.classType) &&
-                    typeArgs[0].type.classType.variadicTypeArguments &&
-                    typeArgs[0].type.classType.variadicTypeArguments.length === 0
-                ) {
-                    typeArgs = [];
-                }
+                });
             }
         }
 
@@ -14260,53 +14267,53 @@ export function createTypeEvaluator(importLookup: ImportLookup, evaluatorOptions
         const lastTypeParam = typeParameters.length > 0 ? typeParameters[typeParameters.length - 1] : undefined;
         const isLastTypeParamVariadic = lastTypeParam ? lastTypeParam.details.isVariadic : false;
 
-        if (typeArgs && typeArgCount > typeParameters.length) {
-            if (
-                !ClassType.isPartiallyConstructed(classType) &&
-                !ClassType.isPseudoVariadicTypeParam(classType) &&
-                !isLastTypeParamVariadic
-            ) {
-                const fileInfo = getFileInfo(errorNode);
-                if (typeParameters.length === 0) {
+        if (typeArgs) {
+            if (typeArgCount > typeParameters.length) {
+                if (
+                    !ClassType.isPartiallyConstructed(classType) &&
+                    !ClassType.isPseudoVariadicTypeParam(classType) &&
+                    !isLastTypeParamVariadic
+                ) {
+                    const fileInfo = getFileInfo(errorNode);
+                    if (typeParameters.length === 0) {
+                        addDiagnostic(
+                            fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
+                            DiagnosticRule.reportGeneralTypeIssues,
+                            Localizer.Diagnostic.typeArgsExpectingNone(),
+                            typeArgs[typeParameters.length].node
+                        );
+                    } else {
+                        addDiagnostic(
+                            fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
+                            DiagnosticRule.reportGeneralTypeIssues,
+                            Localizer.Diagnostic.typeArgsTooMany().format({
+                                name: classType.aliasName || classType.details.name,
+                                expected: typeParameters.length,
+                                received: typeArgCount,
+                            }),
+                            typeArgs[typeParameters.length].node
+                        );
+                    }
+                }
+                typeArgCount = typeParameters.length;
+            } else if (typeArgCount < typeParameters.length) {
+                if (!isLastTypeParamVariadic) {
+                    const fileInfo = getFileInfo(errorNode);
                     addDiagnostic(
-                        fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                        DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.typeArgsExpectingNone(),
-                        typeArgs[typeParameters.length].node
-                    );
-                } else {
-                    addDiagnostic(
-                        fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                        DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.typeArgsTooMany().format({
+                        fileInfo.diagnosticRuleSet.reportMissingTypeArgument,
+                        DiagnosticRule.reportMissingTypeArgument,
+                        Localizer.Diagnostic.typeArgsTooFew().format({
                             name: classType.aliasName || classType.details.name,
                             expected: typeParameters.length,
                             received: typeArgCount,
                         }),
-                        typeArgs[typeParameters.length].node
+                        typeArgs.length > 0 ? typeArgs[0].node.parent! : errorNode
                     );
                 }
             }
-            typeArgCount = typeParameters.length;
-        } else if (typeArgs && typeArgCount < typeParameters.length) {
-            if (!isLastTypeParamVariadic) {
-                const fileInfo = getFileInfo(errorNode);
-                addDiagnostic(
-                    fileInfo.diagnosticRuleSet.reportMissingTypeArgument,
-                    DiagnosticRule.reportMissingTypeArgument,
-                    Localizer.Diagnostic.typeArgsTooFew().format({
-                        name: classType.aliasName || classType.details.name,
-                        expected: typeParameters.length,
-                        received: typeArgCount,
-                    }),
-                    typeArgs.length > 0 ? typeArgs[0].node.parent! : errorNode
-                );
-            }
-        }
 
-        if (typeArgs) {
-            typeArgs.forEach((typeArg) => {
-                validateTypeArg(typeArg);
+            typeArgs.forEach((typeArg, index) => {
+                validateTypeArg(typeArg, isLastTypeParamVariadic && index === typeArgs.length - 1);
             });
         }
 

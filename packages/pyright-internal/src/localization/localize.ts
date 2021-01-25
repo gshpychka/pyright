@@ -700,6 +700,7 @@ export namespace Localizer {
             new ParameterizedString<{ exprType: string; yieldType: string }>(
                 getRawString('Diagnostic.yieldTypeMismatch')
             );
+        export const zeroLengthTupleNotAllowed = () => getRawString('Diagnostic.zeroLengthTupleNotAllowed');
     }
 
     export namespace DiagnosticAddendum {
