@@ -273,7 +273,7 @@ class DocStringConverter {
     }
 
     private _convertIndent(line: string) {
-        line = line.replace(/^([ \t]+)(.+)$/g, (_match, g1, g2) => '&nbsp;'.repeat(g1.length) + g2);
+        line = line.replace(/^([ \t]+)(.+)$/g, (_match, g1, g2) => ' '.repeat(g1.length) + g2);
         return line;
     }
 
